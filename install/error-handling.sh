@@ -1,14 +1,13 @@
 echo "${_group}Setting up error handling ..."
 
-export SENTRY_DSN='https://19555c489ded4769978daae92f2346ca@self-hosted.getsentry.net/3'
-export SENTRY_ORG=self-hosted
-export SENTRY_PROJECT=installer
+if [ -z "${SENTRY_DSN:-}" ]; then
+  export SENTRY_DSN='https://19555c489ded4769978daae92f2346ca@self-hosted.getsentry.net/3'
+fi
 
-$dbuild -t sentry-self-hosted-jq-local --platform=$DOCKER_PLATFORM $basedir/jq
+$dbuild -t sentry-self-hosted-jq-local --platform="$DOCKER_PLATFORM" jq
 
 jq="docker run --rm -i sentry-self-hosted-jq-local"
-sentry_cli="docker run --rm -v /tmp:/work -e SENTRY_ORG=$SENTRY_ORG -e SENTRY_PROJECT=$SENTRY_PROJECT -e SENTRY_DSN=$SENTRY_DSN getsentry/sentry-cli"
-log_path="$basedir/$log_file"
+sentry_cli="docker run --rm -v /tmp:/work -e SENTRY_DSN=$SENTRY_DSN getsentry/sentry-cli"
 
 send_envelope() {
   # Send envelope
@@ -16,16 +15,22 @@ send_envelope() {
 }
 
 generate_breadcrumb_json() {
-  cat $log_path | $jq -R -c 'split("\n") | {"message": (.[0]//""), "category": "log", "level": "info"}'
+  cat $log_file | $jq -R -c 'split("\n") | {"message": (.[0]//""), "category": "log", "level": "info"}'
 }
 
 send_event() {
   # Use traceback hash as the UUID since it is 32 characters long
-  local event_hash=$1
+  local cmd_exit=$1
   local error_msg=$2
-  local traceback_json=$3
-  local breadcrumbs=$4
-  local envelope_file="sentry-envelope-${event_hash}"
+  local traceback=$3
+  local traceback_json=$4
+  local breadcrumbs=$5
+  local fingerprint_value=$(
+    echo -n "$cmd_exit $error_msg $traceback" |
+      docker run -i --rm busybox md5sum |
+      cut -d' ' -f1
+  )
+  local envelope_file="sentry-envelope-${fingerprint_value}"
   local envelope_file_path="/tmp/$envelope_file"
   # If the envelope file exists, we've already sent it
   if [[ -f $envelope_file_path ]]; then
@@ -35,14 +40,14 @@ send_event() {
   # If we haven't sent the envelope file, make it and send to Sentry
   # The format is documented at https://develop.sentry.dev/sdk/envelopes/
   # Grab length of log file, needed for the envelope header to send an attachment
-  local file_length=$(wc -c <$log_path | awk '{print $1}')
+  local file_length=$(wc -c <$log_file | awk '{print $1}')
 
   # Add header for initial envelope information
-  $jq -n -c --arg event_id "$event_hash" \
+  $jq -n -c --arg event_id "$fingerprint_value" \
     --arg dsn "$SENTRY_DSN" \
-    '$ARGS.named' >$envelope_file_path
+    '$ARGS.named' >"$envelope_file_path"
   # Add header to specify the event type of envelope to be sent
-  echo '{"type":"event"}' >>$envelope_file_path
+  echo '{"type":"event"}' >>"$envelope_file_path"
 
   # Next we construct the meat of the event payload, which we build up
   # inside out using jq
@@ -60,23 +65,31 @@ send_event() {
       --argjson stacktrace "$stacktrace" \
       '$ARGS.named'
   )
+
+  # It'd be a bit cleaner in the Sentry UI if we passed the inputs to
+  # fingerprint_value hash rather than the hash itself (I believe the ultimate
+  # hash ends up simply being a hash of our hash), but we want the hash locally
+  # so that we can avoid resending the same event (design decision to avoid
+  # spam in the system). It was also futzy to figure out how to get the
+  # traceback in there properly. Meh.
   event_body=$(
     $jq -n -c --arg level error \
       --argjson exception "{\"values\":[$exception]}" \
       --argjson breadcrumbs "{\"values\": $breadcrumbs}" \
+      --argjson fingerprint "[\"$fingerprint_value\"]" \
       '$ARGS.named'
   )
   echo "$event_body" >>$envelope_file_path
   # Add attachment to the event
   attachment=$(
     $jq -n -c --arg "type" attachment \
-      --arg length $file_length \
+      --arg length "$file_length" \
       --arg content_type "text/plain" \
       --arg filename install_log.txt \
       '{"type": $type,"length": $length|tonumber,"content_type": $content_type,"filename": $filename}'
   )
   echo "$attachment" >>$envelope_file_path
-  cat $log_path >>$envelope_file_path
+  cat $log_file >>$envelope_file_path
   # Send envelope
   send_envelope $envelope_file
 }
@@ -165,7 +178,7 @@ cleanup() {
   if [[ "$1" != "EXIT" ]]; then
     set +o xtrace
     # Save the error message that comes from the last line of the log file
-    error_msg=$(tail -n 1 "$log_path")
+    error_msg=$(tail -n 1 "$log_file")
     # Create the breadcrumb payload now before stacktrace is printed
     # https://develop.sentry.dev/sdk/event-payloads/breadcrumbs/
     # Use sed to remove the last line, that is reported through the error message
@@ -183,8 +196,8 @@ cleanup() {
         local lineno=${BASH_LINENO[$i - 1]}
         local funcname=${FUNCNAME[$i]}
         JSON=$(
-          $jq -n -c --arg filename $src \
-            --arg "function" $funcname \
+          $jq -n -c --arg filename "$src" \
+            --arg "function" "$funcname" \
             --arg lineno "$lineno" \
             '{"filename": $filename, "function": $function, "lineno": $lineno|tonumber}'
         )
@@ -204,8 +217,7 @@ cleanup() {
 
     # Only send event when report issues flag is set and if trap signal is not INT (ctrl+c)
     if [[ "$REPORT_SELF_HOSTED_ISSUES" == 1 && "$1" != "INT" ]]; then
-      local event_hash=$(echo -n "$cmd_exit $traceback" | docker run -i --rm busybox md5sum | cut -d' ' -f1)
-      send_event "$event_hash" "$error_msg" "$traceback_json" "$breadcrumbs"
+      send_event "$cmd_exit" "$error_msg" "$traceback" "$traceback_json" "$breadcrumbs"
     fi
 
     if [[ -n "$MINIMIZE_DOWNTIME" ]]; then
